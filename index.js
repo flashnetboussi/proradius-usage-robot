@@ -86,9 +86,22 @@ function round(n) {
   return n == null ? null : Math.round(n * 100) / 100;
 }
 
+// "Joined" date = expiry minus one month (all accounts were created this month),
+// formatted YYYY-MM-DD. Computed once, then frozen (see sync()).
+function joinedFromExpiry(expiry) {
+  if (!expiry) return "";
+  const d = new Date(String(expiry).replace(" ", "T"));
+  if (Number.isNaN(d.getTime())) return "";
+  d.setMonth(d.getMonth() - 1);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
 async function sync() {
   const token = await login();
   const users = await fetchAllUsers(token);
+  // Existing data so we can FREEZE the "joined" date once it's been set.
+  const existing = (await db.ref("usage").once("value")).val() || {};
   const now = Date.now();
   const updates = {};
   for (const u of users) {
@@ -113,6 +126,7 @@ async function sync() {
       status: u.status || "",
       lastAct: u.last_act || "",
       expiry: u.expire_datetime || "",
+      joined: existing[username]?.joined || joinedFromExpiry(u.expire_datetime),
       updatedAt: now,
     };
   }
