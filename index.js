@@ -182,35 +182,48 @@ function parseCookies(setCookie) {
 const cookieHeader = (c) => Object.entries(c).map(([k, v]) => `${k}=${v}`).join("; ");
 
 async function terraLogin(dispatcher) {
-  // 1) GET the login page → csrftoken cookie + hidden csrfmiddlewaretoken field.
-  const r1 = await request(`${TERRA_URL}/login/`, { dispatcher, headers: { "user-agent": UA } });
+  const loginUrl = `${TERRA_URL}/login/?next=/user/list/`;
+  // 1) GET the login page → csrftoken cookie (+ hidden token if the form has one).
+  const r1 = await request(loginUrl, { dispatcher, headers: { "user-agent": UA } });
   let cookies = parseCookies(r1.headers["set-cookie"]);
   const html = await r1.body.text();
-  const m =
-    html.match(/name=["']csrfmiddlewaretoken["'][^>]*value=["']([^"']+)["']/i) ||
-    html.match(/value=["']([^"']+)["'][^>]*name=["']csrfmiddlewaretoken["']/i);
+  const m = html.match(/name=["']csrfmiddlewaretoken["'][^>]*value=["']([^"']+)["']/i);
   const csrf = (m && m[1]) || cookies.csrftoken || "";
-  // 2) POST the credentials; a successful login sets a sessionid cookie.
-  const body = new URLSearchParams({
-    csrfmiddlewaretoken: csrf,
-    username: TERRA_USER || "",
-    password: TERRA_PASS || "",
-    next: "/user/list/",
-  }).toString();
-  const r2 = await request(`${TERRA_URL}/login/`, {
+  // 2) POST the credentials. This panel's fields are login-username / login-password,
+  //    submitted AJAX-style with the CSRF token in the X-CSRFToken header.
+  const form = new URLSearchParams({
+    "login-username": TERRA_USER || "",
+    "login-password": TERRA_PASS || "",
+  });
+  if (m) form.set("csrfmiddlewaretoken", csrf);
+  const r2 = await request(loginUrl, {
     method: "POST",
     dispatcher,
     headers: {
       "content-type": "application/x-www-form-urlencoded",
+      "x-csrftoken": csrf,
+      "x-requested-with": "XMLHttpRequest",
       cookie: cookieHeader(cookies),
-      referer: `${TERRA_URL}/login/`,
+      referer: loginUrl,
       "user-agent": UA,
     },
-    body,
+    body: form.toString(),
   });
   cookies = { ...cookies, ...parseCookies(r2.headers["set-cookie"]) };
-  await r2.body.dump(); // drain the response so the socket is freed
+  await r2.body.dump();
   if (!cookies.sessionid) throw new Error(`Terra login failed (no sessionid; HTTP ${r2.statusCode})`);
+  // 3) Load the user-list page once (like the browser) to confirm we're logged in
+  //    and to hold the post-login csrftoken the JSON API expects.
+  const r3 = await request(`${TERRA_URL}/user/list/`, {
+    dispatcher,
+    headers: { cookie: cookieHeader(cookies), referer: loginUrl, "user-agent": UA },
+  });
+  const status3 = r3.statusCode;
+  cookies = { ...cookies, ...parseCookies(r3.headers["set-cookie"]) };
+  await r3.body.dump();
+  if (status3 >= 300 && status3 < 400) {
+    throw new Error(`Terra login rejected — check TERRA_USER/TERRA_PASS (HTTP ${status3})`);
+  }
   return cookies;
 }
 
