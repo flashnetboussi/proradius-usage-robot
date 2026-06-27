@@ -6,6 +6,10 @@
 
 import express from "express";
 import admin from "firebase-admin";
+// undici's low-level request() + ProxyAgent: used ONLY for the second ISP (Terra),
+// whose panel is geo-locked to Lebanon, so those calls must exit through a
+// Lebanese proxy. Proradius keeps using Node's built-in global fetch (no proxy).
+import { request, ProxyAgent } from "undici";
 
 const {
   PRORADIUS_URL = "https://acp.novalb.net",
@@ -14,6 +18,12 @@ const {
   FIREBASE_DB_URL,
   FIREBASE_SERVICE_ACCOUNT, // the service-account JSON, pasted as one env var
   SYNC_SECRET,              // shared secret so only your cron can trigger /sync
+  // ---- Second ISP: Terra (Terranet); all optional — Terra stays off until set ----
+  TERRA_URL = "https://acppro.terra.net.lb",
+  TERRA_USER,               // Terra panel login (set on Render, never in code)
+  TERRA_PASS,
+  TERRA_PROXY_URL,          // Lebanese proxy, e.g. http://user:pass@host:port
+  TERRA_INTERVAL_MIN = "20",// how often to sync Terra (keeps proxy traffic low)
   PORT = 10000,
 } = process.env;
 
@@ -134,26 +144,211 @@ async function sync() {
   return { count: Object.keys(updates).length, at: new Date(now).toISOString() };
 }
 
+// ============================================================================
+// Second ISP: Terra (Terranet) — https://acppro.terra.net.lb
+// The panel is geo-locked to Lebanon, so every request below exits through a
+// Lebanese proxy (TERRA_PROXY_URL) via undici. Auth is a Django session: GET the
+// login page for a CSRF token, POST the credentials, then reuse the sessionid
+// cookie for the JSON user list. Usernames are unique across both ISPs, so Terra
+// users are written into the SAME /usage/{username} node — the app needs no change.
+// ============================================================================
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+// Build an undici dispatcher that routes through the Lebanese proxy (if set).
+function terraDispatcher() {
+  if (!TERRA_PROXY_URL) return undefined; // no proxy → direct (won't reach Lebanon)
+  const u = new URL(TERRA_PROXY_URL);
+  const opts = { uri: `${u.protocol}//${u.host}` };
+  if (u.username) {
+    const auth = `${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`;
+    opts.token = `Basic ${Buffer.from(auth).toString("base64")}`;
+  }
+  return new ProxyAgent(opts);
+}
+
+// Set-Cookie header (string or array) → { name: value }
+function parseCookies(setCookie) {
+  const list = Array.isArray(setCookie) ? setCookie : setCookie ? [setCookie] : [];
+  const out = {};
+  for (const line of list) {
+    const [pair] = String(line).split(";");
+    const i = pair.indexOf("=");
+    if (i > 0) out[pair.slice(0, i).trim()] = pair.slice(i + 1).trim();
+  }
+  return out;
+}
+const cookieHeader = (c) => Object.entries(c).map(([k, v]) => `${k}=${v}`).join("; ");
+
+async function terraLogin(dispatcher) {
+  // 1) GET the login page → csrftoken cookie + hidden csrfmiddlewaretoken field.
+  const r1 = await request(`${TERRA_URL}/login/`, { dispatcher, headers: { "user-agent": UA } });
+  let cookies = parseCookies(r1.headers["set-cookie"]);
+  const html = await r1.body.text();
+  const m =
+    html.match(/name=["']csrfmiddlewaretoken["'][^>]*value=["']([^"']+)["']/i) ||
+    html.match(/value=["']([^"']+)["'][^>]*name=["']csrfmiddlewaretoken["']/i);
+  const csrf = (m && m[1]) || cookies.csrftoken || "";
+  // 2) POST the credentials; a successful login sets a sessionid cookie.
+  const body = new URLSearchParams({
+    csrfmiddlewaretoken: csrf,
+    username: TERRA_USER || "",
+    password: TERRA_PASS || "",
+    next: "/user/list/",
+  }).toString();
+  const r2 = await request(`${TERRA_URL}/login/`, {
+    method: "POST",
+    dispatcher,
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      cookie: cookieHeader(cookies),
+      referer: `${TERRA_URL}/login/`,
+      "user-agent": UA,
+    },
+    body,
+  });
+  cookies = { ...cookies, ...parseCookies(r2.headers["set-cookie"]) };
+  await r2.body.dump(); // drain the response so the socket is freed
+  if (!cookies.sessionid) throw new Error(`Terra login failed (no sessionid; HTTP ${r2.statusCode})`);
+  return cookies;
+}
+
+async function terraFetchAllUsers(cookies, dispatcher) {
+  const all = [];
+  const pageSize = 100;
+  let pageIndex = 1;
+  for (let guard = 0; guard < 50; guard++) {
+    const url =
+      `${TERRA_URL}/api/user/list/?username=&shortname=&address=&phone=` +
+      `&resellername=&servicename=&fuplevel=&macaddr=&ip=&expire_datetime=` +
+      `&price=&region=&building=&nationality=&status=0` +
+      `&pageIndex=${pageIndex}&pageSize=${pageSize}`;
+    const r = await request(url, {
+      dispatcher,
+      headers: {
+        accept: "application/json, text/javascript, */*; q=0.01",
+        "x-requested-with": "XMLHttpRequest",
+        "x-csrftoken": cookies.csrftoken || "",
+        cookie: cookieHeader(cookies),
+        referer: `${TERRA_URL}/user/list/`,
+        "user-agent": UA,
+      },
+    });
+    if (r.statusCode !== 200) {
+      await r.body.dump();
+      throw new Error(`Terra users fetch failed: HTTP ${r.statusCode}`);
+    }
+    const j = await r.body.json();
+    const data = j?.data || [];
+    const total = Number(j?.itemscount ?? data.length);
+    all.push(...data);
+    if (data.length === 0 || all.length >= total) break;
+    pageIndex++;
+  }
+  return all;
+}
+
+async function terraSync() {
+  if (!TERRA_USER || !TERRA_PASS) throw new Error("Terra not configured (TERRA_USER/TERRA_PASS)");
+  const dispatcher = terraDispatcher();
+  const cookies = await terraLogin(dispatcher);
+  const users = await terraFetchAllUsers(cookies, dispatcher);
+  const now = Date.now();
+  const updates = {};
+  for (const u of users) {
+    const username = String(u.username || "").trim();
+    if (!username) continue;
+    const { used, quota } = parseTraff(u.used_traff);
+    const percent =
+      typeof u.percent === "number"
+        ? u.percent
+        : used != null && quota
+        ? (used / quota) * 100
+        : null;
+    updates[username] = {
+      username,
+      name: u.shortname || "",
+      service: u.servicename || "",
+      usedGB: round(used),
+      quotaGB: round(quota),
+      remainingGB: used != null && quota != null ? round(Math.max(0, quota - used)) : null,
+      usedText: u.used_traff || "",
+      percent: percent == null ? null : Math.round(percent * 10) / 10,
+      status: u.status || "",
+      lastAct: u.last_act || "",
+      expiry: u.expire_datetime || "",
+      // Terra reports a real signup date, so "joined" is exact (no estimating).
+      joined: String(u.created_datetime || "").split(" ")[0],
+      source: "terra",
+      updatedAt: now,
+    };
+  }
+  await db.ref("usage").update(updates);
+  return { count: Object.keys(updates).length, at: new Date(now).toISOString() };
+}
+
 // ---- HTTP server (Render + cron trigger) ----
-let last = { ok: null, count: 0, at: null, error: null };
+let last = { ok: null, count: 0, at: null, error: null };          // Proradius
+let lastTerra = { ok: null, count: 0, at: null, error: null };     // Terra
+let lastTerraAt = 0;
+const TERRA_INTERVAL_MS = (Number(TERRA_INTERVAL_MIN) || 20) * 60 * 1000;
+const terraEnabled = () => Boolean(TERRA_USER && TERRA_PASS);
 
 const app = express();
 app.get("/", (_req, res) =>
-  res.json({ ok: true, service: "proradius-usage-robot", last })
+  res.json({ ok: true, service: "usage-robot", proradius: last, terra: lastTerra })
 );
+
+// Cron hits /sync every few minutes: Proradius runs every time; Terra is throttled
+// to every TERRA_INTERVAL_MIN minutes to keep proxy traffic tiny. A failure in one
+// ISP never blocks the other. Add ?terra=1 to force a Terra sync this call.
 app.get("/sync", async (req, res) => {
   if (SYNC_SECRET && req.query.key !== SYNC_SECRET) {
     return res.status(403).json({ ok: false, error: "forbidden" });
   }
+  const out = { ok: true };
   try {
     const r = await sync();
     last = { ok: true, ...r, error: null };
-    res.json({ ok: true, ...r });
+    out.proradius = r;
   } catch (e) {
     last = { ok: false, count: 0, at: new Date().toISOString(), error: String(e.message || e) };
-    console.error("[sync]", e);
+    out.proradius = { error: String(e.message || e) };
+    console.error("[proradius]", e);
+  }
+  if (terraEnabled() && (req.query.terra === "1" || Date.now() - lastTerraAt >= TERRA_INTERVAL_MS)) {
+    lastTerraAt = Date.now();
+    try {
+      const r = await terraSync();
+      lastTerra = { ok: true, ...r, error: null };
+      out.terra = r;
+    } catch (e) {
+      lastTerra = { ok: false, count: 0, at: new Date().toISOString(), error: String(e.message || e) };
+      out.terra = { error: String(e.message || e) };
+      console.error("[terra]", e);
+    }
+  } else if (terraEnabled()) {
+    out.terra = { skipped: "throttled" };
+  }
+  res.json(out);
+});
+
+// Force a Terra-only sync right now — handy for testing the proxy + login.
+app.get("/sync-terra", async (req, res) => {
+  if (SYNC_SECRET && req.query.key !== SYNC_SECRET) {
+    return res.status(403).json({ ok: false, error: "forbidden" });
+  }
+  try {
+    const r = await terraSync();
+    lastTerra = { ok: true, ...r, error: null };
+    lastTerraAt = Date.now();
+    res.json({ ok: true, ...r });
+  } catch (e) {
+    lastTerra = { ok: false, count: 0, at: new Date().toISOString(), error: String(e.message || e) };
+    console.error("[terra]", e);
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
-app.listen(PORT, () => console.log("Proradius usage robot listening on", PORT));
+app.listen(PORT, () => console.log("Usage robot listening on", PORT));

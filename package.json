@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "firebase-admin": "^12.7.0"
+    "firebase-admin": "^12.7.0",
+    "undici": "^6.21.0"
   }
 }
