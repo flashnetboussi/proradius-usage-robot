@@ -182,13 +182,24 @@ const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
-// Build an undici dispatcher that routes through the Lebanese proxy (if set).
+const randSession = () => Math.random().toString(36).slice(2, 10);
+
+// Build an undici dispatcher that routes through the Lebanese proxy (if set). On IPRoyal the
+// sticky-session id lives in the password (..._session-XXXX_lifetime-30m); we inject a FRESH
+// session id on every call so each sync gets a new exit IP. That's the cure for the recurring
+// 504s: a residential exit IP that dies is never reused across syncs (the old fixed session
+// kept hammering the same dead IP for its whole 30-min lifetime). The id is constant WITHIN a
+// single sync (same dispatcher for login + fetch), so the Django session stays valid.
 function terraDispatcher() {
   if (!TERRA_PROXY_URL) return undefined; // no proxy → direct (won't reach Lebanon)
   const u = new URL(TERRA_PROXY_URL);
   const opts = { uri: `${u.protocol}//${u.host}` };
   if (u.username) {
-    const auth = `${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`;
+    let pass = decodeURIComponent(u.password || "");
+    pass = /_session-[^_]+/i.test(pass)
+      ? pass.replace(/_session-[^_]+/i, `_session-${randSession()}`)
+      : (pass ? `${pass}_session-${randSession()}` : pass);
+    const auth = `${decodeURIComponent(u.username)}:${pass}`;
     opts.token = `Basic ${Buffer.from(auth).toString("base64")}`;
   }
   return new ProxyAgent(opts);
@@ -288,9 +299,8 @@ async function terraFetchAllUsers(cookies, dispatcher) {
   return all;
 }
 
-async function terraSync() {
+async function terraSync(dispatcher = terraDispatcher()) {
   if (!TERRA_USER || !TERRA_PASS) throw new Error("Terra not configured (TERRA_USER/TERRA_PASS)");
-  const dispatcher = terraDispatcher();
   const cookies = await terraLogin(dispatcher);
   const users = await terraFetchAllUsers(cookies, dispatcher);
   const now = Date.now();
@@ -336,6 +346,22 @@ async function terraSync() {
   return { count: Object.keys(updates).length, at: new Date(now).toISOString() };
 }
 
+// Residential proxies hand out the occasional dead exit IP (504). Each attempt uses a fresh
+// dispatcher = a fresh proxy session = a different exit IP, so a couple of retries almost
+// always lands on a working one.
+async function terraSyncRetry(attempts = 3) {
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await terraSync(terraDispatcher());
+    } catch (e) {
+      lastErr = e;
+      console.error(`[terra] attempt ${i}/${attempts} failed: ${String(e.message || e)}`);
+    }
+  }
+  throw lastErr;
+}
+
 // ---- HTTP server (Render + cron trigger) ----
 let last = { ok: null, count: 0, at: null, error: null };          // Proradius
 let lastTerra = { ok: null, count: 0, at: null, error: null };     // Terra
@@ -368,7 +394,7 @@ app.get("/sync", async (req, res) => {
   if (terraEnabled() && (req.query.terra === "1" || Date.now() - lastTerraAt >= TERRA_INTERVAL_MS)) {
     lastTerraAt = Date.now();
     try {
-      const r = await terraSync();
+      const r = await terraSyncRetry();
       lastTerra = { ok: true, ...r, error: null };
       out.terra = r;
     } catch (e) {
@@ -388,7 +414,7 @@ app.get("/sync-terra", async (req, res) => {
     return res.status(403).json({ ok: false, error: "forbidden" });
   }
   try {
-    const r = await terraSync();
+    const r = await terraSyncRetry();
     lastTerra = { ok: true, ...r, error: null };
     lastTerraAt = Date.now();
     res.json({ ok: true, ...r });
