@@ -107,6 +107,27 @@ function joinedFromExpiry(expiry) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
+// Flag brand-new panel users (added AFTER this feature was switched on) into
+// ispNew/{username} so the manager can import them. On the very first run per
+// source we only seed the "known" set (no flagging), so the existing backlog
+// of un-imported clients isn't dumped on the manager all at once.
+async function detectNewClients(source, rows) {
+  const seededRef = db.ref(`ispSeeded/${source}`);
+  const seeded = (await seededRef.once("value")).val();
+  const known = (await db.ref("ispKnown").once("value")).val() || {};
+  const knownUpd = {};
+  const newUpd = {};
+  const now = Date.now();
+  for (const r of rows) {
+    if (!r.username || known[r.username]) continue;
+    knownUpd[r.username] = true;
+    if (seeded) newUpd[r.username] = { ...r, source, at: now };
+  }
+  if (Object.keys(knownUpd).length) await db.ref("ispKnown").update(knownUpd);
+  if (Object.keys(newUpd).length) await db.ref("ispNew").update(newUpd);
+  if (!seeded) await seededRef.set(true);
+}
+
 async function sync() {
   const token = await login();
   const users = await fetchAllUsers(token);
@@ -141,6 +162,11 @@ async function sync() {
     };
   }
   await db.ref("usage").update(updates);
+  await detectNewClients("nova", users.map((u) => ({
+    username: String(u.username || "").trim(),
+    name: u.shortname || "",
+    service: u.servicename || "",
+  })));
   return { count: Object.keys(updates).length, at: new Date(now).toISOString() };
 }
 
@@ -298,6 +324,15 @@ async function terraSync() {
     };
   }
   await db.ref("usage").update(updates);
+  await detectNewClients("terra", users.map((u) => ({
+    username: String(u.username || "").trim(),
+    name: u.shortname || "",
+    phone: u.phone || "",
+    region: u.region || "",
+    building: u.building || "",
+    note: u.note || "",
+    service: u.servicename || "",
+  })));
   return { count: Object.keys(updates).length, at: new Date(now).toISOString() };
 }
 
