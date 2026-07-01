@@ -128,6 +128,24 @@ async function detectNewClients(source, rows) {
   if (!seeded) await seededRef.set(true);
 }
 
+// Append ONE daily usage sample per user → /usageHistory/{username}/{YYYY-MM-DD}.
+// Re-runs on the same day overwrite that day's point (usage is cumulative, so the
+// latest = the day's peak). Kept tiny (just used GB). This is what powers the
+// portal's usage-trend graph and the monthly "Wrapped" recap.
+async function writeUsageHistory(usageUpdates, now) {
+  const day = new Date(now).toISOString().slice(0, 10); // UTC YYYY-MM-DD
+  const hist = {};
+  for (const [username, rec] of Object.entries(usageUpdates)) {
+    if (rec && rec.usedGB != null) {
+      hist[`${username}/${day}`] = { usedGB: rec.usedGB, quotaGB: rec.quotaGB ?? null, at: now };
+    }
+  }
+  if (Object.keys(hist).length) {
+    try { await db.ref("usageHistory").update(hist); }
+    catch (e) { console.error("usageHistory write failed:", e?.message || e); }
+  }
+}
+
 async function sync() {
   const token = await login();
   const users = await fetchAllUsers(token);
@@ -158,10 +176,12 @@ async function sync() {
       lastAct: u.last_act || "",
       expiry: u.expire_datetime || "",
       joined: existing[username]?.joined || joinedFromExpiry(u.expire_datetime),
+      source: "nova", // Nova/Proradius = a DAILY allowance (Terra is monthly)
       updatedAt: now,
     };
   }
   await db.ref("usage").update(updates);
+  await writeUsageHistory(updates, now);
   await detectNewClients("nova", users.map((u) => ({
     username: String(u.username || "").trim(),
     name: u.shortname || "",
@@ -334,6 +354,7 @@ async function terraSync(dispatcher = terraDispatcher()) {
     };
   }
   await db.ref("usage").update(updates);
+  await writeUsageHistory(updates, now);
   await detectNewClients("terra", users.map((u) => ({
     username: String(u.username || "").trim(),
     name: u.shortname || "",
