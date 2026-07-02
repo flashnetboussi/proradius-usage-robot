@@ -599,6 +599,9 @@ app.post("/ask", async (req, res) => {
       "You have a COMPLETE live snapshot of the business below. `clients` is the full list of every active client — each with their plan, monthly price (USD), payment method, region, supplier, subscription end date, whether they've paid this month, and their live data usage. You also have every bundle/plan (price + cost), all payment methods, regions, MikroTiks, and finance totals (revenue, cost, profit, collected).",
       "Answer any question by working directly with this data — count, filter, sum, sort, and compare it yourself. You genuinely know the whole business, so answer confidently and precisely; don't say you lack data unless a specific detail is truly absent.",
       "Rules: money is USD; dates/times are Beirut time. 'Unpaid/overdue' means paidThisMonth=false (mention subscriptionEnds if relevant). When listing clients, be tidy — name (+ phone/region/amount when useful); for long lists, give the count and the most relevant names, and offer the full list. You can draft WhatsApp messages in Arabic or English on request. Be professional, clear, and well-formatted (short headings/bullets when it helps). Give the answer first, detail after. Never invent numbers.",
+      req.body?.lang === "ar"
+        ? "IMPORTANT: Reply in Arabic (clear Levantine/Lebanese Arabic) unless the manager explicitly asks for English. Keep numbers, prices, dates, phone numbers, and client/plan names as-is."
+        : "Reply in English unless the manager writes in Arabic or asks for Arabic.",
       "Complete business snapshot (JSON):",
       "```json",
       JSON.stringify(ctx),
