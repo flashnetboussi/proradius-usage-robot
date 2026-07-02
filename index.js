@@ -476,14 +476,18 @@ async function requireManager(req) {
   return decoded;
 }
 
-// A compact, current snapshot of the business for the assistant to reason over.
+// A COMPLETE, current snapshot of the whole business — everything the assistant may need
+// to answer any question: every active client with their plan/price/region/supplier/
+// payment method/expiry/usage, all bundles (price + cost), methods, regions, and finances.
 async function buildContext() {
-  const [clientsS, paymentsS, suppliersS, regionsS, methodsS, settingsS] = await Promise.all([
+  const [clientsS, paymentsS, suppliersS, regionsS, methodsS, usageS, mikrotiksS, settingsS] = await Promise.all([
     db.ref("clients").once("value"),
     db.ref("payments").once("value"),
     db.ref("suppliers").once("value"),
     db.ref("regions").once("value"),
     db.ref("paymentMethods").once("value"),
+    db.ref("usage").once("value"),
+    db.ref("mikrotiks").once("value"),
     db.ref("appSettings").once("value"),
   ]);
   const clients = Object.values(clientsS.val() || {});
@@ -491,46 +495,94 @@ async function buildContext() {
   const suppliers = Object.values(suppliersS.val() || {});
   const regions = Object.values(regionsS.val() || {});
   const methods = Object.values(methodsS.val() || {});
+  const mikrotiks = Object.values(mikrotiksS.val() || {});
+  const usage = usageS.val() || {};
+  const settings = settingsS.val() || {};
+
   const now = new Date();
   const period = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Beirut", year: "numeric", month: "2-digit" }).format(now).slice(0, 7); // YYYY-MM (Beirut)
+  const round = (n) => Math.round(Number(n || 0) * 100) / 100;
   const regionName = (id) => regions.find((r) => r.id === id)?.name || "—";
   const methodName = (id) => methods.find((m) => m.id === id)?.name || "Unknown";
   const supplierName = (id) => suppliers.find((s) => s.id === id)?.name || "Unknown";
+  const bundleOf = (c) => { const sup = suppliers.find((s) => s.id === c.supplierId); return sup?.bundles?.find((b) => b.id === c.bundleId) || null; };
+  const bundleLabel = (b) => (b ? (b.displayName || b.name || b.speed || "—") : "—");
+  const clientPrice = (c) => {
+    const b = bundleOf(c);
+    const isMk = !!c.mikrotikId && !!c.mikrotikPortId;
+    const base = isMk ? Number(b?.sellingPrice ?? c.sellingPrice ?? 0) : Number(b?.sellingPrice ?? 0);
+    let amt = Math.max(0, base - Number(c.discount || 0));
+    if (c.hasSatellite) amt += Number(c.satellitePrice || 0);
+    return round(amt);
+  };
+  const clientCost = (c) => round(bundleOf(c)?.cost || 0);
+  const pickUsage = (c) => {
+    for (const k of [c.user, c.mikrotikSecret]) {
+      const key = (k || "").toString().trim();
+      if (!key) continue;
+      if (usage[key]) return usage[key];
+      if (usage[`${key}@mdiab`]) return usage[`${key}@mdiab`];
+    }
+    return null;
+  };
+
   const active = clients.filter((c) => (c.status || "active") === "active");
   const archived = clients.filter((c) => (c.status || "active") === "archived");
   const thisMonth = payments.filter((p) => p.period === period && p.approved !== false);
   const collected = thisMonth.reduce((s, p) => s + Number(p.amount || 0), 0);
   const paidIds = new Set(thisMonth.map((p) => p.clientId));
-  const unpaid = active.filter((c) => !paidIds.has(c.id));
-  const byRegion = {};
-  const byPaymentMethod = {};   // active clients per payment method (Whish, Cash, …)
-  const bySupplier = {};        // active clients per ISP/supplier (Nova, Terra, …)
-  active.forEach((c) => {
-    const r = regionName(c.regionId);
-    byRegion[r] = byRegion[r] || { active: 0, unpaid: 0 };
-    byRegion[r].active++;
-    if (!paidIds.has(c.id)) byRegion[r].unpaid++;
-    const pm = methodName(c.paymentMethodId);
+
+  const byRegion = {}, byPaymentMethod = {}, bySupplier = {};
+  let revenue = 0, cost = 0;
+  const clientList = active.map((c) => {
+    const price = clientPrice(c); revenue += price; cost += clientCost(c);
+    const rn = regionName(c.regionId), pm = methodName(c.paymentMethodId), sp = supplierName(c.supplierId);
+    byRegion[rn] = byRegion[rn] || { active: 0, unpaidThisMonth: 0 };
+    byRegion[rn].active++; if (!paidIds.has(c.id)) byRegion[rn].unpaidThisMonth++;
     byPaymentMethod[pm] = (byPaymentMethod[pm] || 0) + 1;
-    const sp = supplierName(c.supplierId);
     bySupplier[sp] = (bySupplier[sp] || 0) + 1;
+    const u = pickUsage(c);
+    return {
+      name: c.name || "—", region: rn, supplier: sp, plan: bundleLabel(bundleOf(c)),
+      priceUSD: price, pay: pm, phone: c.phone || "",
+      subscriptionEnds: c.subEnd || null, paidThisMonth: paidIds.has(c.id),
+      ...(u ? { usedGB: u.usedGB ?? null, quotaGB: u.quotaGB ?? null, ispExpiry: u.expiry || null } : {}),
+    };
   });
+
   return {
     today: now.toISOString(),
     currentMonth: period,
-    totals: { clients: clients.length, active: active.length, archived: archived.length, suppliers: suppliers.length, regions: regions.length },
-    thisMonth: {
-      collectedUSD: Math.round(collected * 100) / 100,
-      paymentsRecorded: thisMonth.length,
-      clientsPaid: paidIds.size,
-      clientsNotPaidYet: unpaid.length,
+    timezone: "Asia/Beirut",
+    business: {
+      name: "FlashNet — Boussi Fiber Networks (fiber/internet ISP, Lebanon)",
+      contactPhone: settings.contactPhone || "",
+      monthlySurcharge: Number(settings.monthlySurcharge || 0),
+      monthlySurchargeLabel: settings.monthlySurchargeLabel || "",
+      note: "Nova = daily quota, free 12AM–12PM Beirut. Terra = monthly quota.",
     },
-    byRegion,
-    byPaymentMethod,
-    bySupplier,
-    paymentMethodNames: methods.map((m) => m.name).filter(Boolean),
-    notPaidYetSample: unpaid.slice(0, 50).map((c) => ({ name: c.name || "—", region: regionName(c.regionId), phone: c.phone || "" })),
-    businessContactPhone: (settingsS.val() || {}).contactPhone || "",
+    bundlesBySupplier: suppliers.map((s) => ({
+      supplier: s.name || "—",
+      bundles: (s.bundles || []).map((b) => ({
+        name: b.displayName || b.name || "—", speed: b.speed || "",
+        priceUSD: round(b.sellingPrice), costUSD: b.cost != null ? round(b.cost) : null,
+      })),
+    })),
+    paymentMethods: methods.map((m) => m.name).filter(Boolean),
+    regions: regions.map((r) => r.name).filter(Boolean),
+    mikrotiks: mikrotiks.map((m) => m.name).filter(Boolean),
+    totals: { clients: clients.length, active: active.length, archived: archived.length },
+    finance: {
+      expectedMonthlyRevenueUSD: round(revenue),
+      estimatedMonthlyCostUSD: round(cost),
+      estimatedMonthlyProfitUSD: round(revenue - cost),
+      collectedThisMonthUSD: round(collected),
+      paymentsRecordedThisMonth: thisMonth.length,
+      clientsPaidThisMonth: paidIds.size,
+      clientsNotPaidThisMonth: active.filter((c) => !paidIds.has(c.id)).length,
+    },
+    byRegion, byPaymentMethod, bySupplier,
+    clients: clientList,
   };
 }
 
@@ -543,10 +595,11 @@ app.post("/ask", async (req, res) => {
     const history = Array.isArray(req.body?.history) ? req.body.history.slice(-8) : [];
     const ctx = await buildContext();
     const system = [
-      "You are the FlashNet Assistant — a concise, practical business assistant for the manager of FlashNet, a small fiber/internet ISP in Lebanon run by Boussi Fiber Networks.",
-      "You help run the business: answer questions about clients, collections, and finances; draft WhatsApp messages in Arabic or English; explain things; and give general help.",
-      "Money is USD. Dates/times are Beirut time. Be direct and brief. If the snapshot below doesn't contain the answer, say so plainly rather than inventing numbers.",
-      "Live business snapshot (JSON):",
+      "You are Flashy Bot — the professional AI assistant and business analyst for FlashNet, a fiber/internet ISP in Lebanon run by Boussi Fiber Networks. You work for the manager.",
+      "You have a COMPLETE live snapshot of the business below. `clients` is the full list of every active client — each with their plan, monthly price (USD), payment method, region, supplier, subscription end date, whether they've paid this month, and their live data usage. You also have every bundle/plan (price + cost), all payment methods, regions, MikroTiks, and finance totals (revenue, cost, profit, collected).",
+      "Answer any question by working directly with this data — count, filter, sum, sort, and compare it yourself. You genuinely know the whole business, so answer confidently and precisely; don't say you lack data unless a specific detail is truly absent.",
+      "Rules: money is USD; dates/times are Beirut time. 'Unpaid/overdue' means paidThisMonth=false (mention subscriptionEnds if relevant). When listing clients, be tidy — name (+ phone/region/amount when useful); for long lists, give the count and the most relevant names, and offer the full list. You can draft WhatsApp messages in Arabic or English on request. Be professional, clear, and well-formatted (short headings/bullets when it helps). Give the answer first, detail after. Never invent numbers.",
+      "Complete business snapshot (JSON):",
       "```json",
       JSON.stringify(ctx),
       "```",
@@ -555,11 +608,11 @@ app.post("/ask", async (req, res) => {
       ...history
         .filter((h) => h && (h.role === "user" || h.role === "assistant") && h.content)
         .map((h) => ({ role: h.role, content: String(h.content).slice(0, 4000) })),
-      { role: "user", content: question.slice(0, 4000) },
+      { role: "user", content: question.slice(0, 6000) },
     ];
     const resp = await anthropic.messages.create({
       model: "claude-opus-4-8",
-      max_tokens: 1500,
+      max_tokens: 2000,
       system,
       messages,
     });
