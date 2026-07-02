@@ -6,6 +6,7 @@
 
 import express from "express";
 import admin from "firebase-admin";
+import Anthropic from "@anthropic-ai/sdk";
 // undici's low-level request() + ProxyAgent: used ONLY for the second ISP (Terra),
 // whose panel is geo-locked to Lebanon, so those calls must exit through a
 // Lebanese proxy. Proradius keeps using Node's built-in global fetch (no proxy).
@@ -24,6 +25,7 @@ const {
   TERRA_PASS,
   TERRA_PROXY_URL,          // Lebanese proxy, e.g. http://user:pass@host:port
   TERRA_INTERVAL_MIN = "20",// how often to sync Terra (keeps proxy traffic low)
+  ANTHROPIC_API_KEY,        // Claude API key for the in-app assistant (/ask). Set on Render, never in code.
   PORT = 10000,
 } = process.env;
 
@@ -443,6 +445,121 @@ app.get("/sync-terra", async (req, res) => {
     lastTerra = { ok: false, count: 0, at: new Date().toISOString(), error: String(e.message || e) };
     console.error("[terra]", e);
     res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// ─────────────────────────── In-app AI assistant (/ask) ───────────────────────────
+// The manager website calls POST /ask from the browser. Auth is by Firebase ID token
+// (only real managers / collect-admins), so an open CORS origin is safe — a stranger
+// has no valid token and can't spend the Claude budget. The API key lives only here.
+app.use(express.json({ limit: "256kb" }));
+app.use((req, res, next) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Headers", "authorization, content-type");
+  res.set("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
+  if (req.method === "OPTIONS") return res.status(204).end();
+  next();
+});
+
+const anthropic = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
+
+// Only a signed-in manager (or collect-admin) may use the assistant.
+async function requireManager(req) {
+  const m = /^Bearer (.+)$/.exec(req.headers.authorization || "");
+  if (!m) throw new Error("auth: missing token");
+  const decoded = await admin.auth().verifyIdToken(m[1]);
+  const [mgr, adm] = await Promise.all([
+    db.ref(`managers/${decoded.uid}`).once("value"),
+    db.ref(`collectAdmins/${decoded.uid}`).once("value"),
+  ]);
+  if (!mgr.exists() && !adm.exists()) throw new Error("auth: not a manager");
+  return decoded;
+}
+
+// A compact, current snapshot of the business for the assistant to reason over.
+async function buildContext() {
+  const [clientsS, paymentsS, suppliersS, regionsS, settingsS] = await Promise.all([
+    db.ref("clients").once("value"),
+    db.ref("payments").once("value"),
+    db.ref("suppliers").once("value"),
+    db.ref("regions").once("value"),
+    db.ref("appSettings").once("value"),
+  ]);
+  const clients = Object.values(clientsS.val() || {});
+  const payments = Object.values(paymentsS.val() || {});
+  const suppliers = Object.values(suppliersS.val() || {});
+  const regions = Object.values(regionsS.val() || {});
+  const now = new Date();
+  const period = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Beirut", year: "numeric", month: "2-digit" }).format(now).slice(0, 7); // YYYY-MM (Beirut)
+  const regionName = (id) => regions.find((r) => r.id === id)?.name || "—";
+  const active = clients.filter((c) => (c.status || "active") === "active");
+  const archived = clients.filter((c) => (c.status || "active") === "archived");
+  const thisMonth = payments.filter((p) => p.period === period && p.approved !== false);
+  const collected = thisMonth.reduce((s, p) => s + Number(p.amount || 0), 0);
+  const paidIds = new Set(thisMonth.map((p) => p.clientId));
+  const unpaid = active.filter((c) => !paidIds.has(c.id));
+  const byRegion = {};
+  active.forEach((c) => {
+    const r = regionName(c.regionId);
+    byRegion[r] = byRegion[r] || { active: 0, unpaid: 0 };
+    byRegion[r].active++;
+    if (!paidIds.has(c.id)) byRegion[r].unpaid++;
+  });
+  return {
+    today: now.toISOString(),
+    currentMonth: period,
+    totals: { clients: clients.length, active: active.length, archived: archived.length, suppliers: suppliers.length, regions: regions.length },
+    thisMonth: {
+      collectedUSD: Math.round(collected * 100) / 100,
+      paymentsRecorded: thisMonth.length,
+      clientsPaid: paidIds.size,
+      clientsNotPaidYet: unpaid.length,
+    },
+    byRegion,
+    notPaidYetSample: unpaid.slice(0, 50).map((c) => ({ name: c.name || "—", region: regionName(c.regionId), phone: c.phone || "" })),
+    businessContactPhone: (settingsS.val() || {}).contactPhone || "",
+  };
+}
+
+app.post("/ask", async (req, res) => {
+  try {
+    if (!anthropic) return res.status(503).json({ ok: false, error: "The assistant isn't configured yet — add ANTHROPIC_API_KEY on the server." });
+    await requireManager(req);
+    const question = String(req.body?.question || "").trim();
+    if (!question) return res.status(400).json({ ok: false, error: "empty question" });
+    const history = Array.isArray(req.body?.history) ? req.body.history.slice(-8) : [];
+    const ctx = await buildContext();
+    const system = [
+      "You are the FlashNet Assistant — a concise, practical business assistant for the manager of FlashNet, a small fiber/internet ISP in Lebanon run by Boussi Fiber Networks.",
+      "You help run the business: answer questions about clients, collections, and finances; draft WhatsApp messages in Arabic or English; explain things; and give general help.",
+      "Money is USD. Dates/times are Beirut time. Be direct and brief. If the snapshot below doesn't contain the answer, say so plainly rather than inventing numbers.",
+      "Live business snapshot (JSON):",
+      "```json",
+      JSON.stringify(ctx),
+      "```",
+    ].join("\n");
+    const messages = [
+      ...history
+        .filter((h) => h && (h.role === "user" || h.role === "assistant") && h.content)
+        .map((h) => ({ role: h.role, content: String(h.content).slice(0, 4000) })),
+      { role: "user", content: question.slice(0, 4000) },
+    ];
+    const resp = await anthropic.messages.create({
+      model: "claude-opus-4-8",
+      max_tokens: 1500,
+      system,
+      messages,
+    });
+    const answer = (resp.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+    res.json({ ok: true, answer: answer || "(no answer)" });
+  } catch (e) {
+    const msg = String(e?.message || e);
+    const unauthorized = /^auth:/.test(msg) || /token/i.test(msg);
+    console.error("[ask]", msg);
+    res.status(unauthorized ? 401 : 500).json({
+      ok: false,
+      error: unauthorized ? "Not authorized — sign in as a manager." : "Assistant error: " + msg,
+    });
   }
 });
 
