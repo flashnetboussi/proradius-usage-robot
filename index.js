@@ -478,20 +478,24 @@ async function requireManager(req) {
 
 // A compact, current snapshot of the business for the assistant to reason over.
 async function buildContext() {
-  const [clientsS, paymentsS, suppliersS, regionsS, settingsS] = await Promise.all([
+  const [clientsS, paymentsS, suppliersS, regionsS, methodsS, settingsS] = await Promise.all([
     db.ref("clients").once("value"),
     db.ref("payments").once("value"),
     db.ref("suppliers").once("value"),
     db.ref("regions").once("value"),
+    db.ref("paymentMethods").once("value"),
     db.ref("appSettings").once("value"),
   ]);
   const clients = Object.values(clientsS.val() || {});
   const payments = Object.values(paymentsS.val() || {});
   const suppliers = Object.values(suppliersS.val() || {});
   const regions = Object.values(regionsS.val() || {});
+  const methods = Object.values(methodsS.val() || {});
   const now = new Date();
   const period = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Beirut", year: "numeric", month: "2-digit" }).format(now).slice(0, 7); // YYYY-MM (Beirut)
   const regionName = (id) => regions.find((r) => r.id === id)?.name || "—";
+  const methodName = (id) => methods.find((m) => m.id === id)?.name || "Unknown";
+  const supplierName = (id) => suppliers.find((s) => s.id === id)?.name || "Unknown";
   const active = clients.filter((c) => (c.status || "active") === "active");
   const archived = clients.filter((c) => (c.status || "active") === "archived");
   const thisMonth = payments.filter((p) => p.period === period && p.approved !== false);
@@ -499,11 +503,17 @@ async function buildContext() {
   const paidIds = new Set(thisMonth.map((p) => p.clientId));
   const unpaid = active.filter((c) => !paidIds.has(c.id));
   const byRegion = {};
+  const byPaymentMethod = {};   // active clients per payment method (Whish, Cash, …)
+  const bySupplier = {};        // active clients per ISP/supplier (Nova, Terra, …)
   active.forEach((c) => {
     const r = regionName(c.regionId);
     byRegion[r] = byRegion[r] || { active: 0, unpaid: 0 };
     byRegion[r].active++;
     if (!paidIds.has(c.id)) byRegion[r].unpaid++;
+    const pm = methodName(c.paymentMethodId);
+    byPaymentMethod[pm] = (byPaymentMethod[pm] || 0) + 1;
+    const sp = supplierName(c.supplierId);
+    bySupplier[sp] = (bySupplier[sp] || 0) + 1;
   });
   return {
     today: now.toISOString(),
@@ -516,6 +526,9 @@ async function buildContext() {
       clientsNotPaidYet: unpaid.length,
     },
     byRegion,
+    byPaymentMethod,
+    bySupplier,
+    paymentMethodNames: methods.map((m) => m.name).filter(Boolean),
     notPaidYetSample: unpaid.slice(0, 50).map((c) => ({ name: c.name || "—", region: regionName(c.regionId), phone: c.phone || "" })),
     businessContactPhone: (settingsS.val() || {}).contactPhone || "",
   };
