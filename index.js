@@ -19,6 +19,11 @@ const {
   FIREBASE_DB_URL,
   FIREBASE_SERVICE_ACCOUNT, // the service-account JSON, pasted as one env var
   SYNC_SECRET,              // shared secret so only your cron can trigger /sync
+  // ---- Third ISP: Sodetel — ANOTHER Proradius panel (same API as Nova). Not geo-locked,
+  //      so it uses the same direct fetch as Nova (no proxy). Stays off until credentials are set. ----
+  SODETEL_URL = "https://hsi.sodetel.net.lb",
+  SODETEL_USER,             // Sodetel reseller login (set on Render, never in code)
+  SODETEL_PASS,
   // ---- Second ISP: Terra (Terranet); all optional — Terra stays off until set ----
   TERRA_URL = "https://acppro.terra.net.lb",
   TERRA_USER,               // Terra panel login (set on Render, never in code)
@@ -44,30 +49,32 @@ admin.initializeApp({
 });
 const db = admin.database();
 
-// ---- Proradius API ----
-async function login() {
-  const r = await fetch(`${PRORADIUS_URL}/api/token/`, {
+// ---- Proradius API (shared by every Proradius panel: Nova, Sodetel, …) ----
+// Each panel is one config { url, user, pass, source }; the API shape is identical,
+// so login + user-list are written once and reused for all of them.
+async function proradiusLogin(cfg) {
+  const r = await fetch(`${cfg.url}/api/token/`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ username: PRORADIUS_USER, password: PRORADIUS_PASS }),
+    body: JSON.stringify({ username: cfg.user, password: cfg.pass }),
   });
-  if (!r.ok) throw new Error(`Proradius login failed: HTTP ${r.status}`);
+  if (!r.ok) throw new Error(`${cfg.source} login failed: HTTP ${r.status}`);
   const j = await r.json();
-  if (!j.access) throw new Error("Proradius login: no access token in response");
+  if (!j.access) throw new Error(`${cfg.source} login: no access token in response`);
   return j.access;
 }
 
-async function fetchAllUsers(token) {
+async function fetchAllUsers(cfg, token) {
   const all = [];
   const pageSize = 100;
   let pageIndex = 1;
   // Loop pages until we've collected everyone (panel reports body.itemscount).
   for (let guard = 0; guard < 50; guard++) {
     const url =
-      `${PRORADIUS_URL}/api/users?pageIndex=${pageIndex}&pageSize=${pageSize}` +
+      `${cfg.url}/api/users?pageIndex=${pageIndex}&pageSize=${pageSize}` +
       `&sortField=username&sortOrder=asc&usersFilter=my&status=0`;
     const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-    if (!r.ok) throw new Error(`Proradius users fetch failed: HTTP ${r.status}`);
+    if (!r.ok) throw new Error(`${cfg.source} users fetch failed: HTTP ${r.status}`);
     const j = await r.json();
     const data = j?.body?.data || [];
     const total = Number(j?.body?.itemscount ?? data.length);
@@ -148,9 +155,13 @@ async function writeUsageHistory(usageUpdates, now) {
   }
 }
 
-async function sync() {
-  const token = await login();
-  const users = await fetchAllUsers(token);
+// One sync for a Proradius panel. Nova and Sodetel share this — only the config
+// (URL + credentials) and the `source` tag differ. Usernames are unique per panel,
+// so everyone is written into the same /usage/{username} node the app already reads.
+async function proradiusSync(cfg) {
+  if (!cfg.user || !cfg.pass) throw new Error(`${cfg.source} not configured (${cfg.source.toUpperCase()}_USER/${cfg.source.toUpperCase()}_PASS)`);
+  const token = await proradiusLogin(cfg);
+  const users = await fetchAllUsers(cfg, token);
   // Existing data so we can FREEZE the "joined" date once it's been set.
   const existing = (await db.ref("usage").once("value")).val() || {};
   const now = Date.now();
@@ -178,19 +189,26 @@ async function sync() {
       lastAct: u.last_act || "",
       expiry: u.expire_datetime || "",
       joined: existing[username]?.joined || joinedFromExpiry(u.expire_datetime),
-      source: "nova", // Nova/Proradius = a DAILY allowance (Terra is monthly)
+      source: cfg.source,
       updatedAt: now,
     };
   }
   await db.ref("usage").update(updates);
   await writeUsageHistory(updates, now);
-  await detectNewClients("nova", users.map((u) => ({
+  await detectNewClients(cfg.source, users.map((u) => ({
     username: String(u.username || "").trim(),
     name: u.shortname || "",
     service: u.servicename || "",
   })));
   return { count: Object.keys(updates).length, at: new Date(now).toISOString() };
 }
+
+// The Proradius panels we sync. Nova = daily allowance; Sodetel = another Proradius
+// reseller panel (same API, different login). Both hit their API directly (no proxy).
+const NOVA = { url: PRORADIUS_URL, user: PRORADIUS_USER, pass: PRORADIUS_PASS, source: "nova" };
+const SODETEL = { url: SODETEL_URL, user: SODETEL_USER, pass: SODETEL_PASS, source: "sodetel" };
+const sync = () => proradiusSync(NOVA);
+const sodetelSync = () => proradiusSync(SODETEL);
 
 // ============================================================================
 // Second ISP: Terra (Terranet) — https://acppro.terra.net.lb
@@ -386,15 +404,17 @@ async function terraSyncRetry(attempts = 3) {
 }
 
 // ---- HTTP server (Render + cron trigger) ----
-let last = { ok: null, count: 0, at: null, error: null };          // Proradius
+let last = { ok: null, count: 0, at: null, error: null };          // Proradius (Nova)
+let lastSodetel = { ok: null, count: 0, at: null, error: null };   // Sodetel
 let lastTerra = { ok: null, count: 0, at: null, error: null };     // Terra
 let lastTerraAt = 0;
 const TERRA_INTERVAL_MS = (Number(TERRA_INTERVAL_MIN) || 20) * 60 * 1000;
 const terraEnabled = () => Boolean(TERRA_USER && TERRA_PASS);
+const sodetelEnabled = () => Boolean(SODETEL_USER && SODETEL_PASS);
 
 const app = express();
 app.get("/", (_req, res) =>
-  res.json({ ok: true, service: "usage-robot", proradius: last, terra: lastTerra })
+  res.json({ ok: true, service: "usage-robot", proradius: last, sodetel: lastSodetel, terra: lastTerra })
 );
 
 // Cron hits /sync every few minutes: Proradius runs every time; Terra is throttled
@@ -414,6 +434,19 @@ app.get("/sync", async (req, res) => {
     out.proradius = { error: String(e.message || e) };
     console.error("[proradius]", e);
   }
+  // Sodetel: another Proradius panel, direct fetch → run it every sync (like Nova).
+  // A failure here never blocks Nova or Terra.
+  if (sodetelEnabled()) {
+    try {
+      const r = await sodetelSync();
+      lastSodetel = { ok: true, ...r, error: null };
+      out.sodetel = r;
+    } catch (e) {
+      lastSodetel = { ok: false, count: 0, at: new Date().toISOString(), error: String(e.message || e) };
+      out.sodetel = { error: String(e.message || e) };
+      console.error("[sodetel]", e);
+    }
+  }
   if (terraEnabled() && (req.query.terra === "1" || Date.now() - lastTerraAt >= TERRA_INTERVAL_MS)) {
     lastTerraAt = Date.now();
     try {
@@ -429,6 +462,22 @@ app.get("/sync", async (req, res) => {
     out.terra = { skipped: "throttled" };
   }
   res.json(out);
+});
+
+// Force a Sodetel-only sync right now — handy for testing the login/credentials.
+app.get("/sync-sodetel", async (req, res) => {
+  if (SYNC_SECRET && req.query.key !== SYNC_SECRET) {
+    return res.status(403).json({ ok: false, error: "forbidden" });
+  }
+  try {
+    const r = await sodetelSync();
+    lastSodetel = { ok: true, ...r, error: null };
+    res.json({ ok: true, ...r });
+  } catch (e) {
+    lastSodetel = { ok: false, count: 0, at: new Date().toISOString(), error: String(e.message || e) };
+    console.error("[sodetel]", e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
 });
 
 // Force a Terra-only sync right now — handy for testing the proxy + login.
@@ -559,7 +608,7 @@ async function buildContext() {
       contactPhone: settings.contactPhone || "",
       monthlySurcharge: Number(settings.monthlySurcharge || 0),
       monthlySurchargeLabel: settings.monthlySurchargeLabel || "",
-      note: "Nova = daily quota, free 12AM–12PM Beirut. Terra = monthly quota.",
+      note: "Nova = daily quota, free 12AM–12PM Beirut. Terra = monthly quota. Sodetel = a third provider (also a Proradius panel).",
     },
     bundlesBySupplier: suppliers.map((s) => ({
       supplier: s.name || "—",
