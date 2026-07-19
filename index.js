@@ -43,8 +43,22 @@ function loadServiceAccount() {
     : Buffer.from(raw, "base64").toString("utf8");
   return JSON.parse(text);
 }
+let serviceAccount;
+try {
+  serviceAccount = loadServiceAccount();
+  if (!serviceAccount.private_key) throw new Error("parsed, but no private_key field");
+} catch (e) {
+  console.error("✗ FIREBASE_SERVICE_ACCOUNT is missing or not valid JSON — re-copy the WHOLE value");
+  console.error('  (it starts with {"type":"service_account") into the secret / env var.');
+  console.error("  Details:", String(e.message || e));
+  process.exit(1);
+}
+if (!FIREBASE_DB_URL) {
+  console.error("✗ FIREBASE_DB_URL is missing — set it to https://flashnet-32686-default-rtdb.firebaseio.com");
+  process.exit(1);
+}
 admin.initializeApp({
-  credential: admin.credential.cert(loadServiceAccount()),
+  credential: admin.credential.cert(serviceAccount),
   databaseURL: FIREBASE_DB_URL,
 });
 const db = admin.database();
