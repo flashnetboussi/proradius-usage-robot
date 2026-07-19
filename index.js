@@ -681,4 +681,37 @@ app.post("/ask", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log("Usage robot listening on", PORT));
+// ---- One-shot mode (GitHub Actions): `node index.js --once` runs ONE sync of every enabled
+// ISP and exits — no HTTP server. Each run is a fresh process, so the Terra throttle can't
+// live in memory here; it reads/writes ispMeta/lastTerraAt in the database instead (Admin SDK
+// bypasses rules, and clients can't read ispMeta — same as ispKnown/ispSeeded).
+async function runOnce() {
+  const out = {};
+  try { out.proradius = await sync(); } catch (e) { out.proradius = { error: String(e.message || e) }; console.error("[proradius]", e); }
+  if (sodetelEnabled()) {
+    try { out.sodetel = await sodetelSync(); } catch (e) { out.sodetel = { error: String(e.message || e) }; console.error("[sodetel]", e); }
+  }
+  if (terraEnabled()) {
+    let lastAt = 0;
+    try { lastAt = Number((await db.ref("ispMeta/lastTerraAt").once("value")).val() || 0); } catch { /* treat as never-synced */ }
+    if (Date.now() - lastAt >= TERRA_INTERVAL_MS) {
+      try {
+        out.terra = await terraSyncRetry();
+        await db.ref("ispMeta/lastTerraAt").set(Date.now());
+      } catch (e) { out.terra = { error: String(e.message || e) }; console.error("[terra]", e); }
+    } else {
+      out.terra = { skipped: "throttled" };
+    }
+  }
+  console.log("[once]", JSON.stringify(out));
+  // Only fail the workflow when EVERY enabled ISP failed — a single flaky panel shouldn't go red.
+  const results = Object.values(out);
+  const allFailed = results.length > 0 && results.every((r) => r && r.error);
+  process.exit(allFailed ? 1 : 0); // explicit exit — firebase-admin keeps handles open otherwise
+}
+
+if (process.argv.includes("--once")) {
+  runOnce();
+} else {
+  app.listen(PORT, () => console.log("Usage robot listening on", PORT));
+}

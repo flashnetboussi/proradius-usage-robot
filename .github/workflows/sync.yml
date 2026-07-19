@@ -1,0 +1,45 @@
+# GitHub Actions runs the usage sync every ~5 minutes — for free — instead of a paid
+# always-on server. Render then only hosts the AI assistant (/ask), which sleeps.
+# Secrets live in: repo Settings → Secrets and variables → Actions.
+name: Usage sync
+
+on:
+  schedule:
+    - cron: "*/5 * * * *" # every 5 min (GitHub may add a few minutes' delay at busy times)
+  workflow_dispatch: {}    # adds a manual "Run workflow" button for testing
+
+# Never run two syncs at once (a delayed run could overlap the next one).
+concurrency:
+  group: usage-sync
+  cancel-in-progress: false
+
+permissions:
+  actions: write # lets the keepalive step stop GitHub from auto-disabling this schedule
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8 # a hung ISP panel / proxy must not burn minutes forever
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci --omit=dev
+      - name: Run one sync
+        run: node index.js --once
+        env:
+          PRORADIUS_USER: ${{ secrets.PRORADIUS_USER }}
+          PRORADIUS_PASS: ${{ secrets.PRORADIUS_PASS }}
+          SODETEL_USER: ${{ secrets.SODETEL_USER }}
+          SODETEL_PASS: ${{ secrets.SODETEL_PASS }}
+          TERRA_USER: ${{ secrets.TERRA_USER }}
+          TERRA_PASS: ${{ secrets.TERRA_PASS }}
+          TERRA_PROXY_URL: ${{ secrets.TERRA_PROXY_URL }}
+          FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL }}
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+      - name: Keep the schedule alive
+        uses: gautamkrishnar/keepalive-workflow@v2
+        with:
+          use_api: true
