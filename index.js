@@ -53,13 +53,17 @@ try {
   console.error("  Details:", String(e.message || e));
   process.exit(1);
 }
-if (!FIREBASE_DB_URL) {
-  console.error("✗ FIREBASE_DB_URL is missing — set it to https://flashnet-32686-default-rtdb.firebaseio.com");
+// Forgive common paste mistakes in the URL (surrounding quotes, stray whitespace).
+const dbUrl = String(FIREBASE_DB_URL || "").trim().replace(/^["']+|["']+$/g, "");
+if (!/^https:\/\/.+/.test(dbUrl)) {
+  console.error("✗ FIREBASE_DB_URL is missing or not a valid URL — set it to exactly:");
+  console.error("  https://flashnet-32686-default-rtdb.firebaseio.com  (no quotes, no spaces)");
+  console.error("  Current value looks like:", JSON.stringify(FIREBASE_DB_URL || ""));
   process.exit(1);
 }
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  databaseURL: FIREBASE_DB_URL,
+  databaseURL: dbUrl,
 });
 const db = admin.database();
 
