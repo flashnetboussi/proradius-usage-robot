@@ -39,7 +39,9 @@ jobs:
           TERRA_PROXY_URL: ${{ secrets.TERRA_PROXY_URL }}
           FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL }}
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+      # GitHub auto-disables schedules after 60 days without repo activity; re-enabling the
+      # workflow on every run resets that timer. (gh is preinstalled on the runner.)
       - name: Keep the schedule alive
-        uses: gautamkrishnar/keepalive-workflow@v2
-        with:
-          use_api: true
+        run: gh api --method PUT "repos/${{ github.repository }}/actions/workflows/sync.yml/enable"
+        env:
+          GH_TOKEN: ${{ github.token }}
