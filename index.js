@@ -212,6 +212,10 @@ async function proradiusSync(cfg) {
     };
   }
   await db.ref("usage").update(updates);
+  // Per-panel mirror: the SAME username can exist on two panels (Nova and Sodetel both use
+  // Fn-style ids) and in flat /usage the later sync overwrites the earlier one. usageBySrc
+  // keeps each panel's copy so the app can pick the record matching the client's supplier.
+  await db.ref(`usageBySrc/${cfg.source}`).update(updates);
   await writeUsageHistory(updates, now);
   await detectNewClients(cfg.source, users.map((u) => ({
     username: String(u.username || "").trim(),
@@ -392,6 +396,7 @@ async function terraSync(dispatcher = terraDispatcher()) {
     };
   }
   await db.ref("usage").update(updates);
+  await db.ref("usageBySrc/terra").update(updates); // per-panel mirror (see proradiusSync note)
   await writeUsageHistory(updates, now);
   await detectNewClients("terra", users.map((u) => ({
     username: String(u.username || "").trim(),
