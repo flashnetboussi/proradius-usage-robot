@@ -75,6 +75,7 @@ async function proradiusLogin(cfg) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username: cfg.user, password: cfg.pass }),
+    dispatcher: cfg.dispatcher, // optional proxy (Terra) — undefined = direct
   });
   if (!r.ok) throw new Error(`${cfg.source} login failed: HTTP ${r.status}`);
   const j = await r.json();
@@ -91,7 +92,7 @@ async function fetchAllUsers(cfg, token) {
     const url =
       `${cfg.url}/api/users?pageIndex=${pageIndex}&pageSize=${pageSize}` +
       `&sortField=username&sortOrder=asc&usersFilter=my&status=0`;
-    const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` }, dispatcher: cfg.dispatcher });
     if (!r.ok) throw new Error(`${cfg.source} users fetch failed: HTTP ${r.status}`);
     const j = await r.json();
     const data = j?.body?.data || [];
@@ -361,8 +362,17 @@ async function terraFetchAllUsers(cookies, dispatcher) {
   return all;
 }
 
+// 2026-08-21: Terra REPLACED their old Django panel with the same next-gen "Proradius" panel
+// Nova/Sodetel run (the /login/ scraper started dying: the new app is a Next.js SPA that 308s
+// trailing-slash routes and has no server-rendered form; auth is POST /api/token/ → Bearer).
+// Terra is now just a THIRD Proradius config. terraSyncLegacy below is the retired scraper,
+// kept only as reference for the old panel — nothing calls it.
 async function terraSync(dispatcher = terraDispatcher()) {
   if (!TERRA_USER || !TERRA_PASS) throw new Error("Terra not configured (TERRA_USER/TERRA_PASS)");
+  return proradiusSync({ url: TERRA_URL, user: TERRA_USER, pass: TERRA_PASS, source: "terra", dispatcher });
+}
+// eslint-disable-next-line no-unused-vars
+async function terraSyncLegacy(dispatcher) {
   const cookies = await terraLogin(dispatcher);
   const users = await terraFetchAllUsers(cookies, dispatcher);
   const now = Date.now();
@@ -417,7 +427,10 @@ async function terraSyncRetry(attempts = 3) {
   let lastErr;
   for (let i = 1; i <= attempts; i++) {
     try {
-      return await terraSync(terraDispatcher());
+      // Attempt 1 goes DIRECT — cheaper and immune to dead proxy exits; if the new panel is
+      // still geo-locked from the GitHub runner, the later attempts route through the proxy,
+      // each with a fresh session = fresh exit IP (the cure for dead residential exits).
+      return await terraSync(i === 1 ? undefined : terraDispatcher());
     } catch (e) {
       lastErr = e;
       console.error(`[terra] attempt ${i}/${attempts} failed: ${String(e.message || e)}`);
