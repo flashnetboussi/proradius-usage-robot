@@ -717,6 +717,77 @@ app.post("/ask", async (req, res) => {
   }
 });
 
+// ─────────────────────── Portal account admin (/portal-admin) ───────────────────────
+// The manager website manages client PORTAL logins here. The Admin SDK can set/change/delete
+// any account WITHOUT the current password (the browser SDK can't) and with no email-
+// verification step — so this is the only place that fully works, including for old accounts
+// whose password was never stored. Auth: a real MANAGER's Firebase token only (not collectors,
+// not collect-admins — this is credential control). We also mirror the plaintext password into
+// portalCreds/{clientId} (a managers-only node) so the manager can SEE it later; Firebase never
+// stores a readable password, so this stored copy is the only way to reveal it.
+const PORTAL_DOMAIN = "flashnet.portal";
+const toPortalEmail = (u) => `${String(u || "").trim().toLowerCase()}@${PORTAL_DOMAIN}`;
+async function requireRealManager(req) {
+  const m = /^Bearer (.+)$/.exec(req.headers.authorization || "");
+  if (!m) throw new Error("auth: missing token");
+  const decoded = await admin.auth().verifyIdToken(m[1]);
+  const mgr = await db.ref(`managers/${decoded.uid}`).once("value");
+  if (!mgr.exists()) throw new Error("auth: managers only");
+  return decoded;
+}
+app.post("/portal-admin", async (req, res) => {
+  try {
+    const decoded = await requireRealManager(req);
+    const byName = decoded.name || (decoded.email || "").split("@")[0] || "manager";
+    const { action, clientId, username, newUsername, password } = req.body || {};
+    if (!clientId) throw new Error("clientId required");
+    const auth = admin.auth();
+    const getByEmail = async (u) => { try { return await auth.getUserByEmail(toPortalEmail(u)); } catch { return null; } };
+
+    if (action === "set-password") {
+      // Create the login if missing, else just change its password. Doubles as create + reset.
+      if (!username || !password) throw new Error("username and password required");
+      if (String(password).length < 6) throw new Error("Password must be at least 6 characters.");
+      let u = await getByEmail(username);
+      if (u) await auth.updateUser(u.uid, { password });
+      else u = await auth.createUser({ email: toPortalEmail(username), password });
+      await db.ref(`portalCreds/${clientId}`).set({ username: String(username).trim().toLowerCase(), password: String(password), at: Date.now(), byName });
+      await db.ref(`clients/${clientId}`).update({ portalUsername: String(username).trim().toLowerCase(), portalMustChangePassword: false, portalCreatedAt: Date.now() });
+      return res.json({ ok: true });
+    }
+
+    if (action === "set-username") {
+      // Change the login name = change the account email (Admin SDK, no verification needed).
+      if (!newUsername) throw new Error("newUsername required");
+      const taken = await getByEmail(newUsername);
+      if (taken) throw new Error(`Username "${newUsername}" is already taken.`);
+      const u = await getByEmail(username);
+      if (!u) throw new Error("This client has no portal account to rename.");
+      await auth.updateUser(u.uid, { email: toPortalEmail(newUsername) });
+      const clean = String(newUsername).trim().toLowerCase();
+      await db.ref(`portalCreds/${clientId}/username`).set(clean);
+      await db.ref(`portalCreds/${clientId}/at`).set(Date.now());
+      await db.ref(`clients/${clientId}`).update({ portalUsername: clean });
+      return res.json({ ok: true });
+    }
+
+    if (action === "delete") {
+      const u = await getByEmail(username);
+      if (u) await auth.deleteUser(u.uid);
+      await db.ref(`portalCreds/${clientId}`).remove();
+      await db.ref(`clients/${clientId}`).update({ portalUsername: null, portalMustChangePassword: null, portalCreatedAt: null, portalPasswordChangedAt: null });
+      return res.json({ ok: true });
+    }
+
+    throw new Error("unknown action");
+  } catch (e) {
+    const msg = String(e?.message || e);
+    const unauthorized = /^auth:/.test(msg) || /token/i.test(msg);
+    console.error("[portal-admin]", msg);
+    res.status(unauthorized ? 401 : 400).json({ ok: false, error: unauthorized ? "Not authorized — sign in as a manager." : msg });
+  }
+});
+
 // ---- One-shot mode (GitHub Actions): `node index.js --once` runs ONE sync of every enabled
 // ISP and exits — no HTTP server. Each run is a fresh process, so the Terra throttle can't
 // live in memory here; it reads/writes ispMeta/lastTerraAt in the database instead (Admin SDK
